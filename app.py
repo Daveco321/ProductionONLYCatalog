@@ -892,6 +892,23 @@ def proxy_image(sku):
 
 
 # ══════════════════════════════════════════════════
+#  HEALTH CHECK — Root URL
+# ══════════════════════════════════════════════════
+
+@app.route('/', methods=['GET'])
+def health():
+    with _cache_lock:
+        count = len(_cache['inventory'])
+        last = _cache['last_sync']
+    return jsonify({
+        'status': 'ok',
+        'service': 'Production Inventory API',
+        'inventory_count': count,
+        'last_sync': last,
+    })
+
+
+# ══════════════════════════════════════════════════
 #  HOURLY CRON
 # ══════════════════════════════════════════════════
 
