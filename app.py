@@ -54,6 +54,7 @@ AWS_REGION = os.environ.get('AWS_REGION', 'us-east-2')
 S3_BUCKET = os.environ.get('S3_BUCKET', 'nauticaslimfit')
 S3_SNAPSHOT_KEY = os.environ.get('S3_SNAPSHOT_KEY', 'production-inventory/snapshot.json')
 S3_HISTORY_PREFIX = 'production-inventory/history/'
+S3_SHIPPED_KEY = os.environ.get('S3_SHIPPED_KEY', 'production-inventory/shipped_ledger.json')
 
 # Dropbox OAuth
 DROPBOX_APP_KEY = os.environ.get('DROPBOX_APP_KEY', '')
@@ -377,6 +378,139 @@ def save_snapshot(snapshot):
         ContentType='application/json'
     )
 
+
+# ══════════════════════════════════════════════════
+#  SHIPPED LEDGER — Tracks cumulative fulfillment
+#
+#  Solves the "sold-out reappearance" problem:
+#  When committed drops (order fulfilled + closed), we record the delta
+#  as "shipped_out" permanently — so ATS doesn't rebound when the
+#  order falls off the ATS sheet.
+#
+#  Structure: { "SKU": { shipped_out: N, peak_committed: M, history: [...] } }
+# ══════════════════════════════════════════════════
+
+def load_shipped_ledger():
+    """Load the shipped ledger from S3. Starts empty if doesn't exist."""
+    try:
+        resp = get_s3().get_object(Bucket=S3_BUCKET, Key=S3_SHIPPED_KEY)
+        return json.loads(resp['Body'].read().decode('utf-8'))
+    except Exception as e:
+        if 'NoSuchKey' in str(e):
+            print("  📋 No shipped ledger found — starting fresh")
+            return {'last_update': None, 'skus': {}}
+        raise
+
+
+def save_shipped_ledger(ledger):
+    ledger['last_update'] = datetime.utcnow().isoformat() + 'Z'
+    get_s3().put_object(
+        Bucket=S3_BUCKET, Key=S3_SHIPPED_KEY,
+        Body=json.dumps(ledger).encode('utf-8'),
+        ContentType='application/json'
+    )
+
+
+def update_shipped_ledger(ats_items, prod_arrived_by_sku):
+    """
+    Track cumulative deductions per SKU.
+    
+    Logic:
+      - For each SKU, track the peak (highest) committed value we've ever seen
+      - When committed drops below peak, the delta is assumed to be shipped out
+      - shipped_out only grows, never shrinks
+      - Capped at the total arrived production units (can't ship more than we have)
+    
+    Args:
+        ats_items: List of ATS dicts with sku, committed, allocated
+        prod_arrived_by_sku: {sku: total_arrived_units} from snapshot
+    
+    Returns:
+        Updated ledger dict
+    """
+    ledger = load_shipped_ledger()
+    now = datetime.utcnow().isoformat() + 'Z'
+    updated_count = 0
+
+    # Build quick lookup of current ATS state
+    ats_lookup = {i['sku']: i for i in ats_items}
+
+    # Process every SKU we have arrived production for
+    for sku, arrived in prod_arrived_by_sku.items():
+        if arrived <= 0:
+            continue
+
+        ats = ats_lookup.get(sku, {})
+        current_committed = abs(ats.get('committed', 0) or 0)
+        current_allocated = abs(ats.get('allocated', 0) or 0)
+
+        # Get or initialize this SKU's shipped record
+        rec = ledger['skus'].get(sku, {
+            'shipped_out': 0,
+            'peak_committed': 0,
+            'peak_allocated': 0,
+            'history': [],
+            'first_tracked': now,
+        })
+
+        prev_peak_committed = rec.get('peak_committed', 0)
+        prev_peak_allocated = rec.get('peak_allocated', 0)
+
+        # Track peak committed + allocated (highest ever seen)
+        new_peak_committed = max(prev_peak_committed, current_committed)
+        new_peak_allocated = max(prev_peak_allocated, current_allocated)
+
+        # When committed drops from peak, the drop is shipped
+        # (peak - current) = amount that has left since peak
+        # But we only bump shipped_out by the NEW drop since last check
+        prev_drop_committed = prev_peak_committed - (rec.get('prev_committed', prev_peak_committed))
+        new_drop_committed = new_peak_committed - current_committed
+        committed_shipped_delta = max(0, new_drop_committed - prev_drop_committed)
+
+        prev_drop_allocated = prev_peak_allocated - (rec.get('prev_allocated', prev_peak_allocated))
+        new_drop_allocated = new_peak_allocated - current_allocated
+        allocated_shipped_delta = max(0, new_drop_allocated - prev_drop_allocated)
+
+        total_new_shipped = committed_shipped_delta + allocated_shipped_delta
+
+        # Cap shipped_out at arrived (can't ship more than we received)
+        if total_new_shipped > 0:
+            new_shipped_total = min(arrived, rec['shipped_out'] + total_new_shipped)
+            if new_shipped_total > rec['shipped_out']:
+                delta_applied = new_shipped_total - rec['shipped_out']
+                rec['shipped_out'] = new_shipped_total
+                rec['history'].append({
+                    'date': now,
+                    'shipped': delta_applied,
+                    'from_committed': committed_shipped_delta,
+                    'from_allocated': allocated_shipped_delta,
+                })
+                # Keep history reasonable
+                if len(rec['history']) > 50:
+                    rec['history'] = rec['history'][-50:]
+                updated_count += 1
+                print(f"  📤 {sku} shipped +{delta_applied} (total shipped: {new_shipped_total}/{arrived})")
+
+        # Update tracking fields
+        rec['peak_committed'] = new_peak_committed
+        rec['peak_allocated'] = new_peak_allocated
+        rec['prev_committed'] = current_committed
+        rec['prev_allocated'] = current_allocated
+        rec['last_seen'] = now
+        rec['arrived_total'] = arrived
+
+        ledger['skus'][sku] = rec
+
+    if updated_count > 0:
+        save_shipped_ledger(ledger)
+        print(f"  ✓ Shipped ledger updated: {updated_count} SKUs recorded new shipments")
+    else:
+        # Still save to keep prev_committed/prev_allocated fresh
+        save_shipped_ledger(ledger)
+
+    return ledger
+
+
 # ══════════════════════════════════════════════════
 #  DIFF ENGINE
 # ══════════════════════════════════════════════════
@@ -391,12 +525,22 @@ def run_diff(ledger_rows, archive_data=None, current_ats=None):
 
     current_keys = set()
     ledger_map = {}
+    # Track occurrences of same production+style for split shipments (different ETDs)
+    # Key format: production::style::etd — unique per row even if prod+style match
     for row in ledger_rows:
         prod = str(row.get('production', '')).strip()
         style = str(row.get('style', '')).strip().upper()
         if not prod or not style:
             continue
-        key = f"{prod}::{style}"
+        # ETD differentiates split shipments (same PO+style, different arrival dates)
+        etd_part = str(row.get('etd') or 'no-etd').strip()
+        key = f"{prod}::{style}::{etd_part}"
+        # If same key still occurs (identical prod+style+etd), append an index
+        if key in current_keys:
+            i = 2
+            while f"{key}::v{i}" in current_keys:
+                i += 1
+            key = f"{key}::v{i}"
         current_keys.add(key)
         ledger_map[key] = row
 
@@ -486,11 +630,17 @@ def run_diff(ledger_rows, archive_data=None, current_ats=None):
 #  INVENTORY BUILDER
 # ══════════════════════════════════════════════════
 
-def build_inventory(snapshot, ats_items):
-    """Build inventory in same shape as the main platform's /inventory endpoint."""
+def build_inventory(snapshot, ats_items, shipped_ledger=None):
+    """Build inventory in same shape as the main platform's /inventory endpoint.
+    
+    Factors in shipped_out from the shipped ledger so SKUs that have been
+    fully sold through don't rebound when committed/allocated drop.
+    """
     ats_lookup = {}
     for item in ats_items:
         ats_lookup[item['sku']] = item
+    
+    shipped_lookup = (shipped_ledger or {}).get('skus', {})
 
     sku_agg = {}
     for key, order in snapshot.get('orders', {}).items():
@@ -509,9 +659,19 @@ def build_inventory(snapshot, ats_items):
         ats = ats_lookup.get(sku, {})
         committed = ats.get('committed', 0)
         allocated = ats.get('allocated', 0)
-        arrived = agg['arrived']
+        arrived_original = agg['arrived']
         incoming = agg['incoming']
         brand = agg['brand']
+        
+        # ── Shipped deduction ──
+        # Pull how many units this SKU has permanently shipped out
+        shipped_out = 0
+        if sku in shipped_lookup:
+            shipped_out = shipped_lookup[sku].get('shipped_out', 0)
+        
+        # Effective arrived = what came in minus what's already shipped
+        # This prevents sold-out SKUs from rebounding when committed drops
+        arrived_effective = max(0, arrived_original - shipped_out)
 
         inventory.append({
             'sku': sku,
@@ -519,14 +679,17 @@ def build_inventory(snapshot, ats_items):
             'brand_abbr': brand,
             'brand_full': BRAND_FULL_NAMES.get(brand, brand),
             'name': f"{brand} {sku}",
-            'jtw': arrived, 'tr': 0, 'dcw': 0, 'qa': 0,
+            'jtw': arrived_effective, 'tr': 0, 'dcw': 0, 'qa': 0,
             'incoming': incoming,
             'committed': committed,
             'allocated': allocated,
-            'total_ats': arrived + incoming - abs(committed) - abs(allocated),
-            'total_warehouse': arrived,
+            'total_ats': arrived_effective + incoming - abs(committed) - abs(allocated),
+            'total_warehouse': arrived_effective,
             'container': '', 'receive_date': '', 'lot_number': '',
             'image': '',
+            # Metadata for transparency
+            '_arrived_original': arrived_original,
+            '_shipped_out': shipped_out,
         })
 
     return inventory
@@ -580,20 +743,35 @@ def do_sync():
         print("  🔄 Running diff...")
         changes, snapshot = run_diff(ledger, archive_data, ats)
 
-        # 5. Build inventory
+        # 5. Update shipped ledger (tracks cumulative fulfillment to prevent rebound)
+        print("  📤 Updating shipped ledger...")
+        prod_arrived_by_sku = {}
+        for key, order in snapshot.get('orders', {}).items():
+            if order.get('status') == 'in_stock':
+                sku = order.get('style', '').upper()
+                prod_arrived_by_sku[sku] = prod_arrived_by_sku.get(sku, 0) + order.get('units', 0)
+        shipped_ledger = update_shipped_ledger(ats, prod_arrived_by_sku)
+
+        # 6. Build inventory (factors in shipped_out)
         print("  🔨 Building inventory...")
-        inventory = build_inventory(snapshot, ats)
+        inventory = build_inventory(snapshot, ats, shipped_ledger)
 
         with _cache_lock:
             _cache['inventory'] = inventory
             _cache['snapshot'] = snapshot
+            _cache['shipped_ledger'] = shipped_ledger
             _cache['last_sync'] = datetime.utcnow().isoformat() + 'Z'
             _cache['syncing'] = False
 
         elapsed = time.time() - start
+        # Count fully-shipped SKUs for reporting
+        fully_shipped = sum(1 for rec in shipped_ledger.get('skus', {}).values()
+                           if rec.get('shipped_out', 0) >= rec.get('arrived_total', 1))
         print(f"\n  ✅ DONE ({elapsed:.1f}s) — {len(inventory)} SKUs")
         print(f"     New: {changes['new']} | Arrived: {changes['arrived']} | "
               f"Incoming: {changes['incoming']} | In stock: {changes['in_stock']}")
+        print(f"     Shipped ledger: {len(shipped_ledger.get('skus', {}))} SKUs tracked, "
+              f"{fully_shipped} fully shipped out")
         if archive_name:
             print(f"     Archive: {archive_name} (confirmed: {changes['arrived_confirmed']}, denied: {changes['arrived_denied']})")
 
@@ -742,17 +920,130 @@ def force_incoming():
     return jsonify({'ok': True, 'updated': updated})
 
 
+@app.route('/production-discrepancies', methods=['GET', 'OPTIONS'])
+def production_discrepancies():
+    """
+    Compare production data vs warehouse data to find discrepancies.
+    This is READ-ONLY reporting — warehouse numbers never affect the production inventory.
+    
+    Shows:
+      - SKUs where production says it arrived but warehouse shows less (potential receiving issue)
+      - SKUs where warehouse shows more than production recorded (unexplained stock)
+      - SKUs with zero-out events (warehouse dropped to 0)
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        # Get current snapshot
+        with _cache_lock:
+            snap = _cache.get('snapshot')
+        if not snap:
+            snap = load_snapshot()
+        
+        # Get current ATS (for warehouse comparison only)
+        ats = fetch_ats_deductions()
+        ats_lookup = {item['sku']: item for item in ats}
+        
+        # Also get warehouse totals from a fresh ATS fetch
+        ats_bytes = _dbx_download(DROPBOX_ATS_PATH)
+        warehouse_lookup = {}
+        if ats_bytes:
+            wb = openpyxl.load_workbook(BytesIO(ats_bytes), read_only=True, data_only=True)
+            ws = wb[wb.sheetnames[0]]
+            first = True
+            for row in ws.iter_rows(values_only=True):
+                if first:
+                    first = False
+                    continue
+                if not row[0]:
+                    continue
+                sku = str(row[0]).strip().upper()
+                jtw = int(row[6] or 0) if len(row) > 6 else 0
+                tr = int(row[7] or 0) if len(row) > 7 else 0
+                dcw = int(row[8] or 0) if len(row) > 8 else 0
+                qa = int(row[9] or 0) if len(row) > 9 else 0
+                warehouse_lookup[sku] = jtw + tr + dcw + qa
+            wb.close()
+        
+        # Aggregate production data per SKU
+        prod_arrived = {}  # sku -> total arrived units from production
+        prod_incoming = {}  # sku -> total still-incoming units
+        for key, order in snap.get('orders', {}).items():
+            sku = order.get('style', '').upper()
+            if not sku:
+                continue
+            units = order.get('units', 0) or 0
+            if order.get('status') == 'in_stock':
+                prod_arrived[sku] = prod_arrived.get(sku, 0) + units
+            else:
+                prod_incoming[sku] = prod_incoming.get(sku, 0) + units
+        
+        discrepancies = []
+        for sku, prod_total in prod_arrived.items():
+            wh_total = warehouse_lookup.get(sku, 0)
+            ats_item = ats_lookup.get(sku, {})
+            committed = abs(ats_item.get('committed', 0))
+            allocated = abs(ats_item.get('allocated', 0))
+            diff = prod_total - wh_total
+            
+            # Flag if there's a material mismatch
+            if abs(diff) >= 10:  # ignore rounding-level differences
+                discrepancies.append({
+                    'sku': sku,
+                    'brand': ats_item.get('brand', ''),
+                    'production_arrived': prod_total,
+                    'warehouse_actual': wh_total,
+                    'difference': diff,
+                    'committed': committed,
+                    'allocated': allocated,
+                    'sold_through_expected': committed + allocated,
+                    'notes': (
+                        'Factory shipped more than warehouse received' if diff > 0 else
+                        'Warehouse has more than production recorded'
+                    )
+                })
+        
+        # Sort by absolute difference (biggest first)
+        discrepancies.sort(key=lambda d: abs(d['difference']), reverse=True)
+        
+        total_diff_units = sum(abs(d['difference']) for d in discrepancies)
+        
+        return jsonify({
+            'status': 'ok',
+            'count': len(discrepancies),
+            'total_discrepancy_units': total_diff_units,
+            'checked_skus': len(prod_arrived),
+            'discrepancies': discrepancies,
+            'note': 'Warehouse data used for comparison only — production inventory numbers are unchanged',
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/production-reset', methods=['POST', 'GET', 'OPTIONS'])
 def production_reset():
-    """Wipe the snapshot and re-sync from scratch. Use if data is corrupted."""
+    """Wipe the snapshot and re-sync from scratch. Use if data is corrupted.
+    
+    Query param ?wipe_shipped=true also wipes the shipped ledger (full reset).
+    """
     if request.method == 'OPTIONS':
         return '', 204
     try:
         empty = {'last_check': None, 'orders': {}}
         save_snapshot(empty)
+        
+        wipe_shipped = request.args.get('wipe_shipped', '').lower() in ('true', '1', 'yes')
+        if wipe_shipped:
+            save_shipped_ledger({'last_update': None, 'skus': {}})
+            print("🗑️ Shipped ledger also wiped")
+        
         with _cache_lock:
             _cache['inventory'] = []
             _cache['snapshot'] = None
+            _cache['shipped_ledger'] = None
             _cache['last_sync'] = None
         print("🗑️ Snapshot wiped — re-syncing from scratch...")
         changes = do_sync()
@@ -761,11 +1052,77 @@ def production_reset():
             last = _cache['last_sync']
         return jsonify({
             'status': 'ok',
-            'message': 'Snapshot wiped and re-synced',
+            'message': f'Snapshot wiped and re-synced{" (shipped ledger also wiped)" if wipe_shipped else ""}',
             'inventory_count': count,
             'last_sync': last,
             'changes': changes,
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/production-shipped-ledger', methods=['GET', 'OPTIONS'])
+def production_shipped_ledger():
+    """View the shipped ledger — tracks cumulative shipments per SKU."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        with _cache_lock:
+            ledger = _cache.get('shipped_ledger')
+        if not ledger:
+            ledger = load_shipped_ledger()
+        
+        # Summary stats
+        skus = ledger.get('skus', {})
+        total_shipped = sum(rec.get('shipped_out', 0) for rec in skus.values())
+        fully_shipped = [sku for sku, rec in skus.items()
+                        if rec.get('shipped_out', 0) >= rec.get('arrived_total', 1)]
+        partially_shipped = [sku for sku, rec in skus.items()
+                            if 0 < rec.get('shipped_out', 0) < rec.get('arrived_total', 1)]
+        
+        return jsonify({
+            'last_update': ledger.get('last_update'),
+            'tracked_skus': len(skus),
+            'total_units_shipped': total_shipped,
+            'fully_shipped_skus': len(fully_shipped),
+            'partially_shipped_skus': len(partially_shipped),
+            'skus': skus,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/production-shipped-adjust', methods=['POST', 'OPTIONS'])
+def production_shipped_adjust():
+    """Manually adjust shipped_out for a SKU. Use for corrections.
+    Body: { sku: "...", shipped_out: 1000 }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json(force=True, silent=True) or {}
+    sku = data.get('sku', '').upper()
+    new_shipped = int(data.get('shipped_out', 0))
+    if not sku:
+        return jsonify({'error': 'sku required'}), 400
+    try:
+        ledger = load_shipped_ledger()
+        if sku not in ledger['skus']:
+            ledger['skus'][sku] = {
+                'shipped_out': 0, 'peak_committed': 0, 'peak_allocated': 0,
+                'history': [], 'first_tracked': datetime.utcnow().isoformat() + 'Z',
+            }
+        prev = ledger['skus'][sku]['shipped_out']
+        ledger['skus'][sku]['shipped_out'] = max(0, new_shipped)
+        ledger['skus'][sku]['history'].append({
+            'date': datetime.utcnow().isoformat() + 'Z',
+            'manual_adjustment': True,
+            'from': prev,
+            'to': new_shipped,
+        })
+        save_shipped_ledger(ledger)
+        with _cache_lock:
+            _cache['inventory'] = []  # Force rebuild
+        return jsonify({'ok': True, 'sku': sku, 'previous': prev, 'new': new_shipped})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
