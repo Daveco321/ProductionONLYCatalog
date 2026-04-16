@@ -56,6 +56,7 @@ S3_SNAPSHOT_KEY = os.environ.get('S3_SNAPSHOT_KEY', 'production-inventory/snapsh
 S3_HISTORY_PREFIX = 'production-inventory/history/'
 S3_SHIPPED_KEY = os.environ.get('S3_SHIPPED_KEY', 'production-inventory/shipped_ledger.json')
 S3_ARRIVALS_KEY = os.environ.get('S3_ARRIVALS_KEY', 'production-inventory/arrivals_log.json')
+S3_PROD_MANUAL_ALLOC_KEY = os.environ.get('S3_PROD_MANUAL_ALLOC_KEY', 'production-inventory/manual_allocations.json')
 
 # Dropbox OAuth
 DROPBOX_APP_KEY = os.environ.get('DROPBOX_APP_KEY', '')
@@ -1511,7 +1512,7 @@ def production_arrivals_adjust():
 READONLY_ENDPOINTS = [
     '/overrides', '/banner-rules', '/prepack-defaults',
     '/suppression-overrides', '/deduction-assignments',
-    '/manual-allocations', '/allocations', '/saved-catalogs',
+    '/allocations', '/saved-catalogs',
 ]
 
 @app.before_request
@@ -1561,15 +1562,41 @@ def proxy_allocations():
         return jsonify([])
 
 
-@app.route('/manual-allocations', methods=['GET', 'OPTIONS'])
-def proxy_manual_alloc():
+@app.route('/manual-allocations', methods=['GET', 'POST', 'OPTIONS'])
+def manual_allocations():
+    """
+    Production platform's OWN manual allocations.
+    Saves to production-inventory/manual_allocations.json on S3.
+    Independent from the main platform's allocations.
+    """
     if request.method == 'OPTIONS':
         return '', 204
+
+    if request.method == 'GET':
+        try:
+            resp = get_s3().get_object(Bucket=S3_BUCKET, Key=S3_PROD_MANUAL_ALLOC_KEY)
+            data = json.loads(resp['Body'].read().decode('utf-8'))
+            return jsonify(data.get('allocations', []))
+        except Exception as e:
+            if 'NoSuchKey' in str(e):
+                return jsonify([])
+            print(f"  ⚠ Manual allocations read error: {e}")
+            return jsonify([])
+
+    # POST — save allocations
     try:
-        resp = http_requests.get(f'{MAIN_API_URL}/manual-allocations', timeout=10)
-        return jsonify(resp.json())
-    except:
-        return jsonify([])
+        body = request.get_json(force=True, silent=True) or {}
+        allocations = body.get('allocations', [])
+        get_s3().put_object(
+            Bucket=S3_BUCKET, Key=S3_PROD_MANUAL_ALLOC_KEY,
+            Body=json.dumps({'allocations': allocations, 'updated': datetime.utcnow().isoformat() + 'Z'}).encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"  ✓ Manual allocations saved: {len(allocations)} entries")
+        return jsonify({'success': True, 'count': len(allocations)})
+    except Exception as e:
+        print(f"  ⚠ Manual allocations save error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/suppression-overrides', methods=['GET', 'OPTIONS'])
