@@ -408,6 +408,7 @@ def run_diff(ledger_rows, archive_data=None, current_ats=None):
 
     # STEP 1: Process ledger rows
     for key, row in ledger_map.items():
+        style = str(row.get('style', '')).strip().upper()
         brand_code = str(row.get('brand', '')).strip().upper()
         platform_brand = BRAND_CODE_MAP.get(brand_code, brand_code)
         try:
@@ -739,6 +740,34 @@ def force_incoming():
         with _cache_lock:
             _cache['inventory'] = []
     return jsonify({'ok': True, 'updated': updated})
+
+
+@app.route('/production-reset', methods=['POST', 'GET', 'OPTIONS'])
+def production_reset():
+    """Wipe the snapshot and re-sync from scratch. Use if data is corrupted."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        empty = {'last_check': None, 'orders': {}}
+        save_snapshot(empty)
+        with _cache_lock:
+            _cache['inventory'] = []
+            _cache['snapshot'] = None
+            _cache['last_sync'] = None
+        print("🗑️ Snapshot wiped — re-syncing from scratch...")
+        changes = do_sync()
+        with _cache_lock:
+            count = len(_cache['inventory'])
+            last = _cache['last_sync']
+        return jsonify({
+            'status': 'ok',
+            'message': 'Snapshot wiped and re-synced',
+            'inventory_count': count,
+            'last_sync': last,
+            'changes': changes,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ══════════════════════════════════════════════════
