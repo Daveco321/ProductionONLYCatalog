@@ -1526,6 +1526,63 @@
             transition: width 0.3s ease;
             width: 0%;
         }
+
+        /* ══════════════════════════════════════════════════
+           READ-ONLY MODE — Visual disabling of edit buttons
+           ══════════════════════════════════════════════════ */
+        /* Dim and disable any button that saves/adds/deletes protected data */
+        button[onclick*="saveBannerRules"],
+        button[onclick*="savePrepackDefaults"],
+        button[onclick*="saveSuppressionOverrides"],
+        button[onclick*="saveDeductionAssignments"],
+        button[onclick*="saveManualAllocation"],
+        button[onclick*="addBannerRule"],
+        button[onclick*="deleteBannerRule"],
+        button[onclick*="addPrepackRule"],
+        button[onclick*="deletePrepackRule"],
+        button[onclick*="addManualAlloc"],
+        button[onclick*="deleteManualAlloc"],
+        button[onclick*="createAllocation"],
+        button[onclick*="deleteAllocation"],
+        button[onclick*="saveOverride"],
+        button[onclick*="deleteOverride"],
+        button[onclick*="saveDeductionAssignment"],
+        button[onclick*="setDeductionRoute"] {
+            opacity: 0.4 !important;
+            cursor: not-allowed !important;
+            position: relative;
+            filter: grayscale(0.5);
+        }
+        button[onclick*="saveBannerRules"]:hover,
+        button[onclick*="savePrepackDefaults"]:hover,
+        button[onclick*="saveSuppressionOverrides"]:hover,
+        button[onclick*="saveDeductionAssignments"]:hover,
+        button[onclick*="addBannerRule"]:hover,
+        button[onclick*="deleteBannerRule"]:hover,
+        button[onclick*="addPrepackRule"]:hover,
+        button[onclick*="deletePrepackRule"]:hover,
+        button[onclick*="addManualAlloc"]:hover,
+        button[onclick*="deleteManualAlloc"]:hover,
+        button[onclick*="saveOverride"]:hover {
+            opacity: 0.5 !important;
+            transform: none !important;
+            box-shadow: none !important;
+        }
+        /* Read-only indicator on tool headers */
+        .readonly-indicator {
+            display: inline-block;
+            padding: 3px 10px;
+            background: #fef3c7;
+            color: #92400e;
+            border: 1px solid #fcd34d;
+            border-radius: 6px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
     </style>
 </head>
 <body>
@@ -2383,6 +2440,38 @@
         const API_URL = 'https://productiononlycatalog.onrender.com';
         const ORDERS_API_URL = 'https://open-orders-api.onrender.com';
         let _openOrdersCache = null; // cached once per session
+
+        // ══════════════════════════════════════════════════
+        //  READ-ONLY MODE — Intercept all write attempts
+        //  Production platform inherits data from main platform
+        //  but cannot modify overrides, banners, prepacks, allocations, etc.
+        // ══════════════════════════════════════════════════
+        const READONLY_ENDPOINTS = [
+            '/overrides', '/banner-rules', '/prepack-defaults',
+            '/suppression-overrides', '/deduction-assignments',
+            '/manual-allocations', '/allocations', '/saved-catalogs',
+        ];
+        const _originalFetch = window.fetch;
+        window.fetch = function(url, options) {
+            const method = (options && options.method || 'GET').toUpperCase();
+            if (method !== 'GET' && method !== 'OPTIONS' && method !== 'HEAD') {
+                const urlStr = typeof url === 'string' ? url : url.toString();
+                for (const endpoint of READONLY_ENDPOINTS) {
+                    if (urlStr.includes(endpoint)) {
+                        console.warn(`🔒 Read-only mode: blocked ${method} to ${endpoint}`);
+                        if (typeof showToast === 'function') {
+                            showToast('🔒 Read-only platform — make changes on the main inventory platform', 'warning');
+                        }
+                        // Return a fake successful response so the frontend doesn't error out
+                        return Promise.resolve(new Response(
+                            JSON.stringify({ error: 'read_only', message: 'Production platform is read-only' }),
+                            { status: 403, headers: { 'Content-Type': 'application/json' } }
+                        ));
+                    }
+                }
+            }
+            return _originalFetch.apply(this, arguments);
+        };
 
         // ── STABLE CATALOG LINK: Handle ?catalog=SLUG redirect ──
         // If URL is just ?catalog=abc123 (no brands/skus), look up the slug in saved catalogs
@@ -16055,6 +16144,12 @@ TAG-IN RULES:
                             <h3 class="text-xl font-bold mb-2">Ledger vs ATS Audit</h3>
                             <p class="text-sm text-gray-500">Compare Style Ledger production totals against ATS incoming — flags styles where units don't match across the two data sources.</p>
                         </div>
+                        <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-red-500 cursor-pointer transition-all hover:shadow-lg"
+                             onclick="showProductionDiscrepancyReport()">
+                            <div class="text-4xl mb-3">⚖️</div>
+                            <h3 class="text-xl font-bold mb-2">Production vs Warehouse Discrepancies</h3>
+                            <p class="text-sm text-gray-500">Compare what the factory shipped (per style ledger) against what the warehouse actually received. Flags shortages, overages, and receiving issues.</p>
+                        </div>
                     </div>
                 </div>
             `;
@@ -16063,6 +16158,170 @@ TAG-IN RULES:
         // ============================================
         // LEDGER vs ATS AUDIT
         // ============================================
+        // ══════════════════════════════════════════════════
+        //  PRODUCTION vs WAREHOUSE DISCREPANCY REPORT
+        //  
+        //  This is the ONLY tool in the production platform that uses
+        //  actual warehouse quantities — for reporting purposes only.
+        //  It compares what production says arrived (snapshot) against
+        //  what the warehouse actually has (ATS sheet).
+        // ══════════════════════════════════════════════════
+        async function showProductionDiscrepancyReport() {
+            currentView = 'production-discrepancies';
+            history.pushState({ view: 'production-discrepancies' }, '', '#production-discrepancies');
+            
+            document.getElementById('mainContent').innerHTML = `
+                <div class="glass p-6">
+                    <div class="flex items-center gap-3 mb-6">
+                        <button onclick="showAnalysisTools()" class="text-gray-500 hover:text-gray-800 text-xl">←</button>
+                        <h2 class="text-2xl font-bold">⚖️ Production vs Warehouse Discrepancies</h2>
+                    </div>
+                    <div style="padding:14px 16px;background:#fef3c7;border:1px solid #fcd34d;border-radius:10px;margin-bottom:20px;">
+                        <div style="font-size:13px;font-weight:700;color:#92400e;margin-bottom:4px;">ℹ️ About this report</div>
+                        <div style="font-size:12px;color:#78350f;line-height:1.5;">
+                            This is the only tool that compares Production Inventory data against actual warehouse quantities.
+                            It shows where the factory-shipped units (per style ledger) differ from what the warehouse received.
+                            Warehouse numbers are used for comparison only — they do NOT affect the production inventory figures shown elsewhere.
+                        </div>
+                    </div>
+                    <div id="discrepancyContent" style="text-align:center;padding:40px;">
+                        <div class="spinner" style="margin:0 auto 16px;"></div>
+                        <div style="color:#64748b;">Loading discrepancy report...</div>
+                    </div>
+                </div>
+            `;
+            
+            try {
+                const resp = await fetch(`${API_URL}/production-discrepancies`);
+                if (!resp.ok) throw new Error(`Status ${resp.status}`);
+                const data = await resp.json();
+                
+                const container = document.getElementById('discrepancyContent');
+                const discrepancies = data.discrepancies || [];
+                
+                if (discrepancies.length === 0) {
+                    container.innerHTML = `
+                        <div style="padding:60px 20px;">
+                            <div style="font-size:60px;margin-bottom:16px;">✅</div>
+                            <h3 style="font-size:20px;font-weight:700;color:#16a34a;margin-bottom:8px;">No Material Discrepancies Found</h3>
+                            <p style="color:#64748b;max-width:500px;margin:0 auto;">
+                                Production quantities match warehouse quantities for all ${data.checked_skus.toLocaleString()} arrived SKUs.
+                            </p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                // Summary bar
+                const shortages = discrepancies.filter(d => d.difference > 0);
+                const overages = discrepancies.filter(d => d.difference < 0);
+                const totalShortage = shortages.reduce((s, d) => s + d.difference, 0);
+                const totalOverage = overages.reduce((s, d) => s + Math.abs(d.difference), 0);
+                
+                container.innerHTML = `
+                    <!-- Summary cards -->
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:12px;margin-bottom:20px;">
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #6366f1;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Total Discrepancies</div>
+                            <div style="font-size:24px;font-weight:800;color:#0f172a;margin-top:4px;">${discrepancies.length.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">SKUs with 10+ unit mismatch</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #ef4444;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Factory Shortage</div>
+                            <div style="font-size:24px;font-weight:800;color:#dc2626;margin-top:4px;">${totalShortage.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">units shipped but not received (${shortages.length} SKUs)</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #f59e0b;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Warehouse Overage</div>
+                            <div style="font-size:24px;font-weight:800;color:#b45309;margin-top:4px;">${totalOverage.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">units in WH not in production (${overages.length} SKUs)</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #22c55e;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Total Checked</div>
+                            <div style="font-size:24px;font-weight:800;color:#16a34a;margin-top:4px;">${data.checked_skus.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">arrived production SKUs</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Filter -->
+                    <div style="display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
+                        <input id="discrepSearch" placeholder="🔍 Search SKU or brand..." 
+                               style="flex:1;min-width:200px;padding:8px 14px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px;"
+                               oninput="_filterDiscrepancies()">
+                        <select id="discrepTypeFilter" onchange="_filterDiscrepancies()"
+                                style="padding:8px 12px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px;background:white;">
+                            <option value="">All types</option>
+                            <option value="shortage">Shortages only</option>
+                            <option value="overage">Overages only</option>
+                        </select>
+                    </div>
+                    
+                    <!-- Table -->
+                    <div style="background:white;border:1.5px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+                        <div style="overflow-x:auto;">
+                            <table id="discrepTable" style="width:100%;border-collapse:collapse;font-size:13px;">
+                                <thead style="background:#f9fafb;border-bottom:1.5px solid #e5e7eb;">
+                                    <tr>
+                                        <th style="padding:10px 12px;text-align:left;font-weight:700;color:#374151;">SKU</th>
+                                        <th style="padding:10px 12px;text-align:left;font-weight:700;color:#374151;">Brand</th>
+                                        <th style="padding:10px 12px;text-align:right;font-weight:700;color:#374151;">Production Arrived</th>
+                                        <th style="padding:10px 12px;text-align:right;font-weight:700;color:#374151;">Warehouse Actual</th>
+                                        <th style="padding:10px 12px;text-align:right;font-weight:700;color:#374151;">Difference</th>
+                                        <th style="padding:10px 12px;text-align:left;font-weight:700;color:#374151;">Notes</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${discrepancies.map(d => {
+                                        const diffColor = d.difference > 0 ? '#dc2626' : '#b45309';
+                                        const diffBg = d.difference > 0 ? '#fef2f2' : '#fffbeb';
+                                        const typeAttr = d.difference > 0 ? 'shortage' : 'overage';
+                                        return `
+                                            <tr class="discrep-row" data-sku="${d.sku}" data-brand="${d.brand}" data-type="${typeAttr}"
+                                                style="border-bottom:1px solid #f3f4f6;">
+                                                <td style="padding:10px 12px;font-family:monospace;font-weight:600;color:#1f2937;">${d.sku}</td>
+                                                <td style="padding:10px 12px;color:#6b7280;">${d.brand}</td>
+                                                <td style="padding:10px 12px;text-align:right;font-family:monospace;">${d.production_arrived.toLocaleString()}</td>
+                                                <td style="padding:10px 12px;text-align:right;font-family:monospace;">${d.warehouse_actual.toLocaleString()}</td>
+                                                <td style="padding:10px 12px;text-align:right;font-family:monospace;font-weight:700;background:${diffBg};color:${diffColor};">
+                                                    ${d.difference > 0 ? '+' : ''}${d.difference.toLocaleString()}
+                                                </td>
+                                                <td style="padding:10px 12px;color:#6b7280;font-size:12px;">${d.notes}</td>
+                                            </tr>
+                                        `;
+                                    }).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top:16px;text-align:center;color:#9ca3af;font-size:11px;">
+                        ${data.note}
+                    </div>
+                `;
+            } catch (e) {
+                document.getElementById('discrepancyContent').innerHTML = `
+                    <div style="padding:40px;text-align:center;color:#dc2626;">
+                        <div style="font-size:40px;margin-bottom:12px;">⚠️</div>
+                        <div style="font-weight:700;margin-bottom:4px;">Failed to load discrepancy report</div>
+                        <div style="font-size:12px;color:#6b7280;">${e.message}</div>
+                    </div>
+                `;
+            }
+        }
+        
+        function _filterDiscrepancies() {
+            const search = (document.getElementById('discrepSearch')?.value || '').toLowerCase();
+            const type = document.getElementById('discrepTypeFilter')?.value || '';
+            document.querySelectorAll('.discrep-row').forEach(row => {
+                const sku = (row.dataset.sku || '').toLowerCase();
+                const brand = (row.dataset.brand || '').toLowerCase();
+                const rowType = row.dataset.type || '';
+                const matchText = !search || sku.includes(search) || brand.includes(search);
+                const matchType = !type || rowType === type;
+                row.style.display = (matchText && matchType) ? '' : 'none';
+            });
+        }
+
         function showLedgerAtsComparison() {
             currentView = 'ledger-ats-audit';
             history.pushState({ view: 'ledger-ats-audit' }, '', '#ledger-ats-audit');
