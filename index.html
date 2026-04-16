@@ -16150,6 +16150,12 @@ TAG-IN RULES:
                             <h3 class="text-xl font-bold mb-2">Production vs Warehouse Discrepancies</h3>
                             <p class="text-sm text-gray-500">Compare what the factory shipped (per style ledger) against what the warehouse actually received. Flags shortages, overages, and receiving issues.</p>
                         </div>
+                        <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-orange-500 cursor-pointer transition-all hover:shadow-lg"
+                             onclick="showPOArrivalReconciliation()">
+                            <div class="text-4xl mb-3">📦</div>
+                            <h3 class="text-xl font-bold mb-2">PO Arrival Reconciliation</h3>
+                            <p class="text-sm text-gray-500">PO-by-PO tracking of what each production order delivered. Compares warehouse before/after the PO fell off the ledger using archived ATS data.</p>
+                        </div>
                     </div>
                 </div>
             `;
@@ -16321,6 +16327,266 @@ TAG-IN RULES:
                 row.style.display = (matchText && matchType) ? '' : 'none';
             });
         }
+
+
+        // ══════════════════════════════════════════════════
+        //  PO ARRIVAL RECONCILIATION
+        //
+        //  Shows PO-by-PO breakdown of what each production order
+        //  actually delivered. Uses archived ATS data to compare
+        //  warehouse state before vs after each PO fell off.
+        // ══════════════════════════════════════════════════
+        async function showPOArrivalReconciliation() {
+            currentView = 'po-arrivals';
+            history.pushState({ view: 'po-arrivals' }, '', '#po-arrivals');
+
+            document.getElementById('mainContent').innerHTML = `
+                <div class="glass p-6">
+                    <div class="flex items-center gap-3 mb-6">
+                        <button onclick="showAnalysisTools()" class="text-gray-500 hover:text-gray-800 text-xl">←</button>
+                        <h2 class="text-2xl font-bold">📦 PO Arrival Reconciliation</h2>
+                    </div>
+                    <div style="padding:14px 16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;margin-bottom:20px;">
+                        <div style="font-size:13px;font-weight:700;color:#9a3412;margin-bottom:4px;">ℹ️ How this works</div>
+                        <div style="font-size:12px;color:#7c2d12;line-height:1.5;">
+                            When a PO falls off the style ledger, the system walks archived ATS files to compare warehouse quantities before vs after. 
+                            The delta is attributed to that PO. When multiple POs for the same SKU fall off together, the delta is split proportionally by expected units.
+                            <b>Raw delta</b> = warehouse change only. <b>Adjusted delta</b> = warehouse change + concurrent shipments (sales during the window).
+                            Confidence reflects how cleanly the attribution could be made.
+                        </div>
+                    </div>
+                    <div id="arrivalsContent" style="text-align:center;padding:40px;">
+                        <div class="spinner" style="margin:0 auto 16px;"></div>
+                        <div style="color:#64748b;">Loading arrival reconciliation...</div>
+                    </div>
+                </div>
+            `;
+
+            try {
+                const resp = await fetch(`${API_URL}/production-arrivals`);
+                if (!resp.ok) throw new Error(`Status ${resp.status}`);
+                const data = await resp.json();
+
+                const container = document.getElementById('arrivalsContent');
+                const receipts = data.receipts || [];
+                const pending = data.pending || [];
+
+                if (receipts.length === 0 && pending.length === 0) {
+                    container.innerHTML = `
+                        <div style="padding:60px 20px;">
+                            <div style="font-size:60px;margin-bottom:16px;">📭</div>
+                            <h3 style="font-size:20px;font-weight:700;color:#64748b;margin-bottom:8px;">No Arrivals Reconciled Yet</h3>
+                            <p style="color:#94a3b8;max-width:500px;margin:0 auto;line-height:1.5;">
+                                As POs fall off the style ledger over time, they'll be reconciled against warehouse archives and appear here.
+                                Reconciliation requires at least 2 hours of archive data after a PO's drop-off date.
+                            </p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                const confBadge = (c) => {
+                    const map = { high: ['#dcfce7', '#166534'], medium: ['#fef3c7', '#92400e'], low: ['#fee2e2', '#991b1b'], manual: ['#dbeafe', '#1e40af'] };
+                    const [bg, color] = map[c] || map.low;
+                    return `<span style="display:inline-block;padding:2px 8px;background:${bg};color:${color};border-radius:10px;font-size:10px;font-weight:700;text-transform:uppercase;">${c}</span>`;
+                };
+
+                const fmtDate = (iso) => {
+                    if (!iso) return '—';
+                    try { return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); }
+                    catch { return iso; }
+                };
+
+                container.innerHTML = `
+                    <!-- Summary cards -->
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:12px;margin-bottom:20px;">
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #6366f1;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">POs Reconciled</div>
+                            <div style="font-size:24px;font-weight:800;color:#0f172a;margin-top:4px;">${data.total_reconciled.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">${data.total_pending} pending reconciliation</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #22c55e;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Expected Total</div>
+                            <div style="font-size:24px;font-weight:800;color:#16a34a;margin-top:4px;">${data.total_expected_units.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">units per style ledger</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #3b82f6;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Received (Adjusted)</div>
+                            <div style="font-size:24px;font-weight:800;color:#1e40af;margin-top:4px;">${data.total_received_units_adjusted.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">factoring in concurrent sales</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid ${data.total_shortage > 0 ? '#ef4444' : '#22c55e'};border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Net Shortage</div>
+                            <div style="font-size:24px;font-weight:800;color:${data.total_shortage > 0 ? '#dc2626' : '#16a34a'};margin-top:4px;">${data.total_shortage.toLocaleString()}</div>
+                            <div style="font-size:11px;color:#9ca3af;">total shortfall across POs</div>
+                        </div>
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-left:4px solid #a855f7;border-radius:10px;padding:14px 16px;">
+                            <div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Confidence</div>
+                            <div style="display:flex;gap:6px;margin-top:6px;font-size:11px;flex-wrap:wrap;">
+                                <span>${confBadge('high')} ${(data.by_confidence.high || 0)}</span>
+                                <span>${confBadge('medium')} ${(data.by_confidence.medium || 0)}</span>
+                                <span>${confBadge('low')} ${(data.by_confidence.low || 0)}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Filters -->
+                    <div style="display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
+                        <input id="poSearch" placeholder="🔍 Search PO, style, or brand..." 
+                               style="flex:1;min-width:200px;padding:8px 14px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px;"
+                               oninput="_filterArrivals()">
+                        <select id="poConfFilter" onchange="_filterArrivals()"
+                                style="padding:8px 12px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px;background:white;">
+                            <option value="">All confidence</option>
+                            <option value="high">High only</option>
+                            <option value="medium">Medium only</option>
+                            <option value="low">Low only</option>
+                            <option value="manual">Manual only</option>
+                        </select>
+                        <select id="poShortageFilter" onchange="_filterArrivals()"
+                                style="padding:8px 12px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:13px;background:white;">
+                            <option value="">All POs</option>
+                            <option value="short">Shortage only</option>
+                            <option value="over">Overage only</option>
+                            <option value="clean">Clean match only</option>
+                        </select>
+                        <button onclick="_reprocessArrivals()" 
+                                style="padding:8px 14px;background:#f97316;color:white;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;">
+                            🔄 Re-process
+                        </button>
+                    </div>
+
+                    <!-- Reconciled table -->
+                    <div style="background:white;border:1.5px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+                        <div style="padding:12px 16px;background:#f9fafb;border-bottom:1.5px solid #e5e7eb;font-weight:700;font-size:13px;color:#374151;">
+                            Reconciled POs (${receipts.length})
+                        </div>
+                        <div style="overflow-x:auto;">
+                            <table id="arrivalsTable" style="width:100%;border-collapse:collapse;font-size:12px;">
+                                <thead style="background:#fafafa;border-bottom:1.5px solid #e5e7eb;">
+                                    <tr>
+                                        <th style="padding:10px 8px;text-align:left;font-weight:700;color:#374151;">PO #</th>
+                                        <th style="padding:10px 8px;text-align:left;font-weight:700;color:#374151;">PO Name</th>
+                                        <th style="padding:10px 8px;text-align:left;font-weight:700;color:#374151;">Style</th>
+                                        <th style="padding:10px 8px;text-align:left;font-weight:700;color:#374151;">Brand</th>
+                                        <th style="padding:10px 8px;text-align:right;font-weight:700;color:#374151;">Expected</th>
+                                        <th style="padding:10px 8px;text-align:right;font-weight:700;color:#374151;">Received (Raw)</th>
+                                        <th style="padding:10px 8px;text-align:right;font-weight:700;color:#374151;">Received (Adj)</th>
+                                        <th style="padding:10px 8px;text-align:right;font-weight:700;color:#374151;">Shortage</th>
+                                        <th style="padding:10px 8px;text-align:center;font-weight:700;color:#374151;">Concurrent POs</th>
+                                        <th style="padding:10px 8px;text-align:center;font-weight:700;color:#374151;">Confidence</th>
+                                        <th style="padding:10px 8px;text-align:left;font-weight:700;color:#374151;">Fell Off</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${receipts.map(r => {
+                                        const shortage = r.shortage_vs_expected || 0;
+                                        let shortageType = 'clean';
+                                        if (shortage > 0) shortageType = 'short';
+                                        else if (shortage < 0) shortageType = 'over';
+                                        const shortColor = shortage > 0 ? '#dc2626' : shortage < 0 ? '#b45309' : '#16a34a';
+                                        const shortBg = shortage > 0 ? '#fef2f2' : shortage < 0 ? '#fffbeb' : '#f0fdf4';
+                                        return `
+                                            <tr class="arrival-row" 
+                                                data-po="${(r.production || '').toLowerCase()}" 
+                                                data-style="${(r.style || '').toLowerCase()}" 
+                                                data-brand="${(r.brand || '').toLowerCase()}"
+                                                data-confidence="${r.confidence}"
+                                                data-shortage-type="${shortageType}"
+                                                style="border-bottom:1px solid #f3f4f6;">
+                                                <td style="padding:10px 8px;font-family:monospace;font-weight:700;color:#1f2937;">${r.production || '—'}</td>
+                                                <td style="padding:10px 8px;color:#6b7280;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.po_name || ''}">${r.po_name || '—'}</td>
+                                                <td style="padding:10px 8px;font-family:monospace;color:#1f2937;">${r.style || '—'}</td>
+                                                <td style="padding:10px 8px;color:#6b7280;">${r.brand || '—'}</td>
+                                                <td style="padding:10px 8px;text-align:right;font-family:monospace;">${(r.expected_units || 0).toLocaleString()}</td>
+                                                <td style="padding:10px 8px;text-align:right;font-family:monospace;color:#6b7280;">${(r.received_units_raw || 0).toLocaleString()}</td>
+                                                <td style="padding:10px 8px;text-align:right;font-family:monospace;font-weight:700;">${(r.received_units_adjusted || 0).toLocaleString()}</td>
+                                                <td style="padding:10px 8px;text-align:right;font-family:monospace;font-weight:700;background:${shortBg};color:${shortColor};">${shortage > 0 ? '+' : ''}${shortage.toLocaleString()}</td>
+                                                <td style="padding:10px 8px;text-align:center;color:${r.concurrent_pos_same_sku > 1 ? '#f59e0b' : '#6b7280'};">${r.concurrent_pos_same_sku || 1}</td>
+                                                <td style="padding:10px 8px;text-align:center;">${confBadge(r.confidence)}</td>
+                                                <td style="padding:10px 8px;color:#9ca3af;font-size:11px;">${fmtDate(r.fell_off_date)}</td>
+                                            </tr>
+                                        `;
+                                    }).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    ${pending.length > 0 ? `
+                        <div style="background:white;border:1.5px solid #e5e7eb;border-radius:10px;overflow:hidden;margin-top:16px;">
+                            <div style="padding:12px 16px;background:#fffbeb;border-bottom:1.5px solid #fde68a;font-weight:700;font-size:13px;color:#92400e;">
+                                ⏳ Pending Reconciliation (${pending.length})
+                            </div>
+                            <div style="padding:10px 16px;font-size:12px;color:#78350f;">
+                                These POs have fallen off the ledger but can't be reconciled yet — usually because archives aren't available for the time window, or the drop-off is too recent.
+                            </div>
+                            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                                <thead style="background:#fafafa;border-bottom:1px solid #fde68a;">
+                                    <tr>
+                                        <th style="padding:8px;text-align:left;font-weight:700;color:#374151;">Key</th>
+                                        <th style="padding:8px;text-align:left;font-weight:700;color:#374151;">Reason</th>
+                                        <th style="padding:8px;text-align:left;font-weight:700;color:#374151;">Fell Off</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${pending.slice(0, 50).map(p => `
+                                        <tr style="border-bottom:1px solid #fef3c7;">
+                                            <td style="padding:8px;font-family:monospace;">${p.key}</td>
+                                            <td style="padding:8px;color:#92400e;">${p.reason}</td>
+                                            <td style="padding:8px;color:#9ca3af;">${fmtDate(p.fell_off)}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    ` : ''}
+                `;
+            } catch (e) {
+                document.getElementById('arrivalsContent').innerHTML = `
+                    <div style="padding:40px;text-align:center;color:#dc2626;">
+                        <div style="font-size:40px;margin-bottom:12px;">⚠️</div>
+                        <div style="font-weight:700;margin-bottom:4px;">Failed to load arrival reconciliation</div>
+                        <div style="font-size:12px;color:#6b7280;">${e.message}</div>
+                    </div>
+                `;
+            }
+        }
+
+        function _filterArrivals() {
+            const search = (document.getElementById('poSearch')?.value || '').toLowerCase();
+            const conf = document.getElementById('poConfFilter')?.value || '';
+            const shortFilter = document.getElementById('poShortageFilter')?.value || '';
+            document.querySelectorAll('.arrival-row').forEach(row => {
+                const po = row.dataset.po || '';
+                const style = row.dataset.style || '';
+                const brand = row.dataset.brand || '';
+                const rowConf = row.dataset.confidence || '';
+                const rowShort = row.dataset.shortageType || '';
+                const matchText = !search || po.includes(search) || style.includes(search) || brand.includes(search);
+                const matchConf = !conf || rowConf === conf;
+                const matchShort = !shortFilter || rowShort === shortFilter;
+                row.style.display = (matchText && matchConf && matchShort) ? '' : 'none';
+            });
+        }
+
+        async function _reprocessArrivals() {
+            if (!confirm('Re-run arrival reconciliation? This will re-check all pending POs against the archive folder.')) return;
+            try {
+                showToast('🔄 Re-processing arrivals...', 'info');
+                const resp = await fetch(`${API_URL}/production-arrivals-reprocess`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.status === 'ok') {
+                    showToast(`✅ Re-processed: ${data.total_reconciled} reconciled, ${data.total_pending} pending`, 'success');
+                    showPOArrivalReconciliation(); // Refresh view
+                } else {
+                    showToast(`⚠️ Reprocess failed: ${data.error || 'unknown'}`, 'error');
+                }
+            } catch (e) {
+                showToast(`⚠️ Failed: ${e.message}`, 'error');
+            }
+        }
+
 
         function showLedgerAtsComparison() {
             currentView = 'ledger-ats-audit';
