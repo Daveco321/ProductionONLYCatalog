@@ -1529,25 +1529,17 @@
 
         /* ══════════════════════════════════════════════════
            READ-ONLY MODE — Visual disabling of edit buttons
+           Only for tools inherited from main platform (banners, prepacks, overrides).
+           Allocations have their own S3 storage and work independently.
            ══════════════════════════════════════════════════ */
-        /* Dim and disable any button that saves/adds/deletes protected data */
         button[onclick*="saveBannerRules"],
         button[onclick*="savePrepackDefaults"],
-        button[onclick*="saveSuppressionOverrides"],
-        button[onclick*="saveDeductionAssignments"],
-        button[onclick*="saveManualAllocation"],
         button[onclick*="addBannerRule"],
         button[onclick*="deleteBannerRule"],
         button[onclick*="addPrepackRule"],
         button[onclick*="deletePrepackRule"],
-        button[onclick*="addManualAlloc"],
-        button[onclick*="deleteManualAlloc"],
-        button[onclick*="createAllocation"],
-        button[onclick*="deleteAllocation"],
         button[onclick*="saveOverride"],
-        button[onclick*="deleteOverride"],
-        button[onclick*="saveDeductionAssignment"],
-        button[onclick*="setDeductionRoute"] {
+        button[onclick*="deleteOverride"] {
             opacity: 0.4 !important;
             cursor: not-allowed !important;
             position: relative;
@@ -1555,14 +1547,10 @@
         }
         button[onclick*="saveBannerRules"]:hover,
         button[onclick*="savePrepackDefaults"]:hover,
-        button[onclick*="saveSuppressionOverrides"]:hover,
-        button[onclick*="saveDeductionAssignments"]:hover,
         button[onclick*="addBannerRule"]:hover,
         button[onclick*="deleteBannerRule"]:hover,
         button[onclick*="addPrepackRule"]:hover,
         button[onclick*="deletePrepackRule"]:hover,
-        button[onclick*="addManualAlloc"]:hover,
-        button[onclick*="deleteManualAlloc"]:hover,
         button[onclick*="saveOverride"]:hover {
             opacity: 0.5 !important;
             transform: none !important;
@@ -2449,7 +2437,7 @@
         const READONLY_ENDPOINTS = [
             '/overrides', '/banner-rules', '/prepack-defaults',
             '/suppression-overrides', '/deduction-assignments',
-            '/manual-allocations', '/allocations', '/saved-catalogs',
+            '/allocations', '/saved-catalogs',
         ];
         const _originalFetch = window.fetch;
         window.fetch = function(url, options) {
@@ -16106,13 +16094,7 @@ TAG-IN RULES:
                              onclick="showAllocationManager()">
                             <div class="text-4xl mb-3">📦</div>
                             <h3 class="text-xl font-bold mb-2">Virtual Warehouse Allocations</h3>
-                            <p class="text-sm text-gray-500">View all current allocations from S3. Add, edit, or delete manual commitments — saved across all devices.</p>
-                        </div>
-                        <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-indigo-500 cursor-pointer transition-all hover:shadow-lg"
-                             onclick="showDeductionApplication()">
-                            <div class="text-4xl mb-3">🎯</div>
-                            <h3 class="text-xl font-bold mb-2">Deduction Application</h3>
-                            <p class="text-sm text-gray-500">Assign allocations to Warehouse or Overseas ATS for styles with inventory in both. Overrides smart rule logic.</p>
+                            <p class="text-sm text-gray-500">Add, edit, or delete manual commitments for this platform. Saves independently from the main inventory platform.</p>
                         </div>
                         <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-amber-500 cursor-pointer transition-all hover:shadow-lg"
                              onclick="showOverseasSummary()">
@@ -16123,26 +16105,14 @@ TAG-IN RULES:
                         <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-purple-500 cursor-pointer transition-all hover:shadow-lg"
                              onclick="showPrepackDefaultsManager()">
                             <div class="text-4xl mb-3">📐</div>
-                            <h3 class="text-xl font-bold mb-2">Prepack Defaults</h3>
-                            <p class="text-sm text-gray-500">Set default size packs by category (Long Sleeve, Pants, Short Sleeve, etc.) and fit code. Per-item overrides always take priority.</p>
-                        </div>
-                        <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-rose-500 cursor-pointer transition-all hover:shadow-lg"
-                             onclick="showSuppressedSkus()">
-                            <div class="text-4xl mb-3">🚫</div>
-                            <h3 class="text-xl font-bold mb-2">Suppressed SKUs</h3>
-                            <p class="text-sm text-gray-500">Styles with overseas production likely already received at warehouse. Suppressed from overseas view to prevent double-counting.</p>
+                            <h3 class="text-xl font-bold mb-2">Prepack Defaults <span class="readonly-indicator">VIEW ONLY</span></h3>
+                            <p class="text-sm text-gray-500">View size packs by category and fit code. Edit on the main inventory platform.</p>
                         </div>
                         <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-teal-500 cursor-pointer transition-all hover:shadow-lg"
                              onclick="showBannerManager()">
                             <div class="text-4xl mb-3">🏷️</div>
-                            <h3 class="text-xl font-bold mb-2">Assign Banners</h3>
-                            <p class="text-sm text-gray-500">Create custom labels that appear on product tiles. Assign by category, fit, brand, customer, or specific SKUs.</p>
-                        </div>
-                        <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-cyan-500 cursor-pointer transition-all hover:shadow-lg"
-                             onclick="showLedgerAtsComparison()">
-                            <div class="text-4xl mb-3">🔍</div>
-                            <h3 class="text-xl font-bold mb-2">Ledger vs ATS Audit</h3>
-                            <p class="text-sm text-gray-500">Compare Style Ledger production totals against ATS incoming — flags styles where units don't match across the two data sources.</p>
+                            <h3 class="text-xl font-bold mb-2">Assign Banners <span class="readonly-indicator">VIEW ONLY</span></h3>
+                            <p class="text-sm text-gray-500">View banner assignments inherited from the main platform. Edit on the main inventory platform.</p>
                         </div>
                         <div class="bg-white rounded-xl p-6 border-2 border-transparent hover:border-red-500 cursor-pointer transition-all hover:shadow-lg"
                              onclick="showProductionDiscrepancyReport()">
