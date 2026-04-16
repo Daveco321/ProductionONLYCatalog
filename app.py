@@ -55,6 +55,7 @@ S3_BUCKET = os.environ.get('S3_BUCKET', 'nauticaslimfit')
 S3_SNAPSHOT_KEY = os.environ.get('S3_SNAPSHOT_KEY', 'production-inventory/snapshot.json')
 S3_HISTORY_PREFIX = 'production-inventory/history/'
 S3_SHIPPED_KEY = os.environ.get('S3_SHIPPED_KEY', 'production-inventory/shipped_ledger.json')
+S3_ARRIVALS_KEY = os.environ.get('S3_ARRIVALS_KEY', 'production-inventory/arrivals_log.json')
 
 # Dropbox OAuth
 DROPBOX_APP_KEY = os.environ.get('DROPBOX_APP_KEY', '')
@@ -512,6 +513,253 @@ def update_shipped_ledger(ats_items, prod_arrived_by_sku):
 
 
 # ══════════════════════════════════════════════════
+#  ARRIVAL RECONCILIATION — PO-level receipt tracking
+#
+#  When a PO falls off the style ledger, we walk forward through
+#  ATS archives to observe the warehouse column increasing. The
+#  first increase after the PO drop-off is attributed to that PO.
+#
+#  Handles:
+#    - Single PO drop-off (clean attribution)
+#    - Multiple concurrent POs (proportional split by expected units)
+#    - Concurrent sales (committed drops) — shown alongside raw delta
+#
+#  Output: permanent log of "we expected X units, received Y units"
+#  Structure: { "PC25002::ROUSDPP06SRS::2026-04-30": { ...receipt data... } }
+# ══════════════════════════════════════════════════
+
+def load_arrivals_log():
+    try:
+        resp = get_s3().get_object(Bucket=S3_BUCKET, Key=S3_ARRIVALS_KEY)
+        return json.loads(resp['Body'].read().decode('utf-8'))
+    except Exception as e:
+        if 'NoSuchKey' in str(e):
+            print("  📋 No arrivals log found — starting fresh")
+            return {'last_update': None, 'receipts': {}, 'pending': {}}
+        raise
+
+
+def save_arrivals_log(log):
+    log['last_update'] = datetime.utcnow().isoformat() + 'Z'
+    get_s3().put_object(
+        Bucket=S3_BUCKET, Key=S3_ARRIVALS_KEY,
+        Body=json.dumps(log).encode('utf-8'),
+        ContentType='application/json'
+    )
+
+
+def _parse_archive_date(name):
+    """Extract datetime from archive filename like 'Inventory_ATS_2026-04-13_160237.xlsx'"""
+    m = re.search(r'(\d{4}-\d{2}-\d{2})_(\d{6})', name)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)}_{m.group(2)}", '%Y-%m-%d_%H%M%S')
+        except ValueError:
+            return None
+    return None
+
+
+def _get_archive_at_time(target_dt, tolerance_hours=2):
+    """Find the archive file closest to target_dt (within tolerance). Returns path or None."""
+    files = refresh_archive_index()
+    if not files:
+        return None
+    best = None
+    best_diff = float('inf')
+    tolerance_s = tolerance_hours * 3600
+    for f in files:
+        diff = abs((f['dt'] - target_dt).total_seconds())
+        if diff < best_diff and diff <= tolerance_s:
+            best_diff = diff
+            best = f
+    return best
+
+
+def _fetch_wh_committed_at_time(target_dt, tolerance_hours=2):
+    """
+    Fetch warehouse + committed totals per SKU at a specific point in time.
+    Returns: { sku: { warehouse, committed, allocated } } or None
+    """
+    archive_file = _get_archive_at_time(target_dt, tolerance_hours)
+    if not archive_file:
+        return None
+
+    data = _dbx_download(archive_file['path'])
+    if not data:
+        return None
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        result = {}
+        first = True
+        for row in ws.iter_rows(values_only=True):
+            if first:
+                first = False
+                continue
+            if not row[0]:
+                continue
+            sku = str(row[0]).strip().upper()
+            jtw = int(row[6] or 0) if len(row) > 6 else 0
+            tr = int(row[7] or 0) if len(row) > 7 else 0
+            dcw = int(row[8] or 0) if len(row) > 8 else 0
+            qa = int(row[9] or 0) if len(row) > 9 else 0
+            committed = int(row[10] or 0) if len(row) > 10 else 0
+            allocated = int(row[11] or 0) if len(row) > 11 else 0
+            result[sku] = {
+                'warehouse': jtw + tr + dcw + qa,
+                'committed': abs(committed),
+                'allocated': abs(allocated),
+            }
+        wb.close()
+        return result
+    except Exception as e:
+        print(f"  ⚠ Archive parse error: {e}")
+        return None
+
+
+def reconcile_new_arrivals(snapshot):
+    """
+    Process any POs that flipped to in_stock but haven't been reconciled yet.
+    Compares warehouse column before/after drop-off to estimate actual receipt.
+    """
+    arrivals_log = load_arrivals_log()
+    receipts = arrivals_log.setdefault('receipts', {})
+    pending = arrivals_log.setdefault('pending', {})
+
+    # Step 1: Find all in_stock orders not yet in receipts
+    # Group by (sku, fell_off_date) — POs that fell off at the same time need joint attribution
+    groups = {}  # fell_off_date_bucket -> {sku: [orders]}
+    for key, order in snapshot.get('orders', {}).items():
+        if order.get('status') != 'in_stock':
+            continue
+        if key in receipts:
+            continue  # Already reconciled
+        fell_off = order.get('fell_off_date')
+        if not fell_off:
+            continue
+
+        # Bucket by hour (POs that fell off in same hourly sync)
+        try:
+            fell_dt = datetime.fromisoformat(fell_off.replace('Z', '+00:00')).replace(tzinfo=None)
+        except Exception:
+            continue
+
+        hour_bucket = fell_dt.replace(minute=0, second=0, microsecond=0).isoformat()
+        sku = order.get('style', '').upper()
+        groups.setdefault(hour_bucket, {}).setdefault(sku, []).append((key, order, fell_dt))
+
+    if not groups:
+        save_arrivals_log(arrivals_log)
+        return arrivals_log
+
+    # Step 2: For each group, look up warehouse state before and after
+    reconciled_count = 0
+    pending_count = 0
+
+    for hour_bucket, sku_groups in groups.items():
+        try:
+            bucket_dt = datetime.fromisoformat(hour_bucket)
+        except Exception:
+            continue
+
+        # Need at least 2 hours since drop-off to have post-arrival data
+        age_hours = (datetime.utcnow() - bucket_dt).total_seconds() / 3600
+        if age_hours < 2:
+            # Too recent — defer to next sync
+            for sku, orders in sku_groups.items():
+                for key, _, _ in orders:
+                    pending[key] = {'reason': 'too_recent', 'fell_off': hour_bucket}
+                    pending_count += 1
+            continue
+
+        # Fetch WH state BEFORE drop-off (1-2 hours before)
+        before_dt = bucket_dt - timedelta(hours=2)
+        before_data = _fetch_wh_committed_at_time(before_dt, tolerance_hours=3)
+
+        # Fetch WH state AFTER drop-off (2-24 hours after)
+        after_dt = bucket_dt + timedelta(hours=4)
+        after_data = _fetch_wh_committed_at_time(after_dt, tolerance_hours=6)
+
+        if not before_data or not after_data:
+            # Archives not available for this time window
+            for sku, orders in sku_groups.items():
+                for key, _, _ in orders:
+                    pending[key] = {'reason': 'archives_unavailable', 'fell_off': hour_bucket}
+                    pending_count += 1
+            continue
+
+        for sku, orders in sku_groups.items():
+            wh_before = before_data.get(sku, {}).get('warehouse', 0)
+            wh_after = after_data.get(sku, {}).get('warehouse', 0)
+            committed_before = before_data.get(sku, {}).get('committed', 0)
+            committed_after = after_data.get(sku, {}).get('committed', 0)
+
+            # Raw delta: what warehouse column changed by
+            raw_delta = wh_after - wh_before
+            # Committed delta: if committed dropped, goods also shipped out (mask arrivals)
+            # Adjusted: arrivals = raw_delta + committed_drop (add back what shipped out)
+            committed_drop = max(0, committed_before - committed_after)
+            adjusted_delta = raw_delta + committed_drop
+
+            total_expected = sum(o[1].get('units', 0) for o in orders)
+
+            for key, order, fell_dt in orders:
+                expected = order.get('units', 0)
+
+                # Proportional attribution if multiple POs for same SKU
+                if len(orders) > 1 and total_expected > 0:
+                    share = expected / total_expected
+                    po_received_raw = int(raw_delta * share)
+                    po_received_adjusted = int(adjusted_delta * share)
+                    method = 'proportional_split'
+                    confidence = 'medium' if len(orders) <= 3 else 'low'
+                else:
+                    po_received_raw = raw_delta
+                    po_received_adjusted = adjusted_delta
+                    method = 'single_po_isolation'
+                    # High confidence if received is within 10% of expected
+                    if expected > 0:
+                        pct = abs(po_received_adjusted - expected) / expected
+                        confidence = 'high' if pct < 0.1 else 'medium' if pct < 0.3 else 'low'
+                    else:
+                        confidence = 'low'
+
+                # Sanity: negative received makes no sense (means WH decreased more than committed drop)
+                if po_received_adjusted < 0:
+                    po_received_adjusted = 0
+                    confidence = 'low'
+
+                receipts[key] = {
+                    'production': order.get('production'),
+                    'po_name': order.get('po_name', ''),
+                    'style': sku,
+                    'brand': order.get('brand', ''),
+                    'expected_units': expected,
+                    'received_units_raw': po_received_raw,
+                    'received_units_adjusted': po_received_adjusted,
+                    'committed_drop_during_window': committed_drop,
+                    'shortage_vs_expected': expected - po_received_adjusted,
+                    'wh_before': wh_before,
+                    'wh_after': wh_after,
+                    'fell_off_date': hour_bucket,
+                    'reconciled_date': datetime.utcnow().isoformat() + 'Z',
+                    'method': method,
+                    'concurrent_pos_same_sku': len(orders),
+                    'confidence': confidence,
+                }
+                # Remove from pending if it was there
+                pending.pop(key, None)
+                reconciled_count += 1
+
+    if reconciled_count or pending_count:
+        save_arrivals_log(arrivals_log)
+        print(f"  📋 Arrivals reconciled: {reconciled_count} new | {pending_count} pending")
+
+    return arrivals_log
+
+
+# ══════════════════════════════════════════════════
 #  DIFF ENGINE
 # ══════════════════════════════════════════════════
 
@@ -752,7 +1000,15 @@ def do_sync():
                 prod_arrived_by_sku[sku] = prod_arrived_by_sku.get(sku, 0) + order.get('units', 0)
         shipped_ledger = update_shipped_ledger(ats, prod_arrived_by_sku)
 
-        # 6. Build inventory (factors in shipped_out)
+        # 6. Reconcile PO-level arrivals (compares warehouse before/after drop-off)
+        print("  📋 Reconciling PO arrivals against warehouse archives...")
+        try:
+            arrivals_log = reconcile_new_arrivals(snapshot)
+        except Exception as e:
+            print(f"  ⚠ Arrival reconciliation error: {e}")
+            arrivals_log = load_arrivals_log()
+
+        # 7. Build inventory (factors in shipped_out)
         print("  🔨 Building inventory...")
         inventory = build_inventory(snapshot, ats, shipped_ledger)
 
@@ -760,6 +1016,7 @@ def do_sync():
             _cache['inventory'] = inventory
             _cache['snapshot'] = snapshot
             _cache['shipped_ledger'] = shipped_ledger
+            _cache['arrivals_log'] = arrivals_log
             _cache['last_sync'] = datetime.utcnow().isoformat() + 'Z'
             _cache['syncing'] = False
 
@@ -1123,6 +1380,121 @@ def production_shipped_adjust():
         with _cache_lock:
             _cache['inventory'] = []  # Force rebuild
         return jsonify({'ok': True, 'sku': sku, 'previous': prev, 'new': new_shipped})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/production-arrivals', methods=['GET', 'OPTIONS'])
+def production_arrivals():
+    """
+    PO-level arrival reconciliation report.
+    Shows what each production order was expected to deliver vs what 
+    the warehouse actually received (from archive comparison).
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        with _cache_lock:
+            log = _cache.get('arrivals_log')
+        if not log:
+            log = load_arrivals_log()
+        
+        receipts = log.get('receipts', {})
+        pending = log.get('pending', {})
+        
+        # Build summary
+        receipts_list = []
+        total_expected = 0
+        total_received_raw = 0
+        total_received_adjusted = 0
+        by_confidence = {'high': 0, 'medium': 0, 'low': 0}
+        
+        for key, r in receipts.items():
+            receipts_list.append({'key': key, **r})
+            total_expected += r.get('expected_units', 0)
+            total_received_raw += r.get('received_units_raw', 0)
+            total_received_adjusted += r.get('received_units_adjusted', 0)
+            conf = r.get('confidence', 'low')
+            by_confidence[conf] = by_confidence.get(conf, 0) + 1
+        
+        # Sort by shortage descending (biggest problems first)
+        receipts_list.sort(key=lambda r: r.get('shortage_vs_expected', 0), reverse=True)
+        
+        # Pending POs (not yet reconcilable)
+        pending_list = []
+        for key, p in pending.items():
+            pending_list.append({'key': key, **p})
+        
+        return jsonify({
+            'last_update': log.get('last_update'),
+            'total_reconciled': len(receipts),
+            'total_pending': len(pending),
+            'total_expected_units': total_expected,
+            'total_received_units_raw': total_received_raw,
+            'total_received_units_adjusted': total_received_adjusted,
+            'total_shortage': total_expected - total_received_adjusted,
+            'by_confidence': by_confidence,
+            'receipts': receipts_list,
+            'pending': pending_list,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/production-arrivals-reprocess', methods=['POST', 'GET', 'OPTIONS'])
+def production_arrivals_reprocess():
+    """
+    Re-run arrival reconciliation. Useful if archives weren't available
+    during a prior sync and now they are.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        snapshot = load_snapshot()
+        log = reconcile_new_arrivals(snapshot)
+        with _cache_lock:
+            _cache['arrivals_log'] = log
+        return jsonify({
+            'status': 'ok',
+            'total_reconciled': len(log.get('receipts', {})),
+            'total_pending': len(log.get('pending', {})),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/production-arrivals-adjust', methods=['POST', 'OPTIONS'])
+def production_arrivals_adjust():
+    """
+    Manually override a reconciled arrival record.
+    Body: { key: "PC25002::ROUSDPP06SRS::2026-04-30", received_units: 2220, notes: "..." }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json(force=True, silent=True) or {}
+    key = data.get('key', '')
+    received = data.get('received_units')
+    notes = data.get('notes', '')
+    if not key or received is None:
+        return jsonify({'error': 'key and received_units required'}), 400
+    try:
+        log = load_arrivals_log()
+        if key not in log.get('receipts', {}):
+            return jsonify({'error': 'receipt not found'}), 404
+        received = int(received)
+        rec = log['receipts'][key]
+        rec['received_units_adjusted'] = received
+        rec['shortage_vs_expected'] = rec.get('expected_units', 0) - received
+        rec['manual_override'] = True
+        rec['manual_notes'] = notes
+        rec['manually_adjusted_at'] = datetime.utcnow().isoformat() + 'Z'
+        rec['confidence'] = 'manual'
+        save_arrivals_log(log)
+        with _cache_lock:
+            _cache['arrivals_log'] = log
+        return jsonify({'ok': True, 'key': key, 'received_units': received})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
